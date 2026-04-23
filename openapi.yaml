@@ -1,0 +1,608 @@
+openapi: 3.0.3
+info:
+  title: Ermes Notification Platform API
+  version: 0.1.0
+  description: |
+    Multi-tenant notification platform. Receives business events from producer backends,
+    persists personal notifications in MariaDB, and delivers them in real time to the
+    frontend via Socket.IO.
+
+    **Authentication:**
+    - Producer endpoints (POST /api/v1/events): HTTP Basic (api_key:api_secret)
+    - User inbox endpoints: Bearer JWT (RS256, issued by tenant backend via JWKS federation)
+    - Admin endpoints: x-admin-secret header
+    - Probe endpoints (health, ready): no authentication
+
+servers:
+  - url: https://ermes.yourcompany.com
+    description: Ermes core server
+
+components:
+  securitySchemes:
+    ProducerBasic:
+      type: http
+      scheme: basic
+      description: api_key:api_secret obtained from POST /api/v1/admin/tenants
+    TenantJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: RS256 JWT issued by the tenant backend. Claims required — iss, aud, sub, tenant_id, exp, iat.
+    AdminSecret:
+      type: apiKey
+      in: header
+      name: x-admin-secret
+      description: Shared secret for tenant provisioning operations (env ADMIN_API_SECRET, >= 32 chars).
+
+  schemas:
+    InboxItem:
+      type: object
+      required: [notification_uuid, topic, title, created_at]
+      properties:
+        notification_uuid:
+          type: string
+          format: uuid
+          description: Public identifier. Use for client-side deduplication.
+        topic:
+          type: string
+          description: Logical notification category (e.g. contracts.approved).
+        title:
+          type: string
+          description: Short display title.
+        body:
+          type: string
+          nullable: true
+          description: Notification body. Markdown or plain text (max 10000 chars).
+        severity:
+          type: string
+          nullable: true
+          enum: [info, warning, error, success]
+        entity_type:
+          type: string
+          nullable: true
+          description: Domain entity type (e.g. contract, invoice).
+        entity_id:
+          type: string
+          nullable: true
+          description: Domain entity identifier.
+        payload:
+          type: object
+          nullable: true
+          description: Custom JSON metadata from the producer.
+        read_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO 8601. null if not yet read.
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 creation timestamp.
+
+    Pagination:
+      type: object
+      required: [page, limit, total, nextCursor]
+      properties:
+        page:
+          type: integer
+        limit:
+          type: integer
+        total:
+          type: integer
+        nextCursor:
+          type: string
+          nullable: true
+          description: Cursor for the next page. null on last page.
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code.
+        details:
+          type: object
+          description: Validation details (present on 400 validation errors only).
+
+paths:
+  /.well-known/jwks.json:
+    get:
+      summary: JWKS endpoint (tenant-side)
+      description: |
+        Exposed by the tenant backend (not by the Ermes core). The Ermes core fetches
+        this URL (configured at tenant registration) to validate user JWT signatures.
+        Implement using NotificationClient::getJwks().
+      tags: [Tenant]
+      responses:
+        '200':
+          description: JWKS public key set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kty: { type: string, example: RSA }
+                        use: { type: string, example: sig }
+                        alg: { type: string, example: RS256 }
+                        kid: { type: string }
+                        n: { type: string }
+                        e: { type: string }
+
+  /api/v1/events:
+    post:
+      summary: Send a business event
+      description: |
+        Ingests a business event and transforms it into persistent notifications + live delivery.
+        Inserts record in event_inbox (DB-first), then creates notifications and notification_recipients,
+        publishes to Redis for Socket.IO.
+        Returns 202 on first send, 200 with status=already_processed on retry with same event_id.
+      tags: [Producer]
+      security:
+        - ProducerBasic: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_key, application_id, topic, title, recipient_users]
+              properties:
+                event_id:
+                  type: string
+                  maxLength: 255
+                  description: Idempotency key. If omitted, must be provided via x-idempotency-key header.
+                tenant_key:
+                  type: string
+                  maxLength: 100
+                  description: Logical tenant identifier. Must match authenticated tenant.
+                application_id:
+                  type: string
+                  maxLength: 100
+                  description: Producer application identifier (e.g. contracts-backoffice).
+                topic:
+                  type: string
+                  maxLength: 255
+                  description: Logical notification category (e.g. contracts.approved).
+                title:
+                  type: string
+                  maxLength: 255
+                  description: Short display title shown to the user.
+                body:
+                  type: string
+                  nullable: true
+                  maxLength: 10000
+                  description: Notification body. Markdown or plain text.
+                severity:
+                  type: string
+                  nullable: true
+                  enum: [info, warning, error, success]
+                entity_type:
+                  type: string
+                  nullable: true
+                  maxLength: 100
+                entity_id:
+                  type: string
+                  nullable: true
+                  maxLength: 255
+                correlation_id:
+                  type: string
+                  nullable: true
+                  maxLength: 255
+                  description: Correlation ID propagated in logs for cross-service tracing.
+                recipient_users:
+                  type: array
+                  items: { type: string }
+                  minItems: 1
+                  maxItems: 500
+                  description: List of user IDs (NOT room names). e.g. 'user_42'.
+                payload:
+                  type: object
+                  nullable: true
+                  description: Custom JSON metadata. Propagated unchanged to inbox and Socket.IO event.
+                event_name:
+                  type: string
+                  nullable: true
+                  pattern: '^[a-zA-Z0-9_\.\:\-]{1,100}$'
+                  description: Override for the Socket.IO event name. Default is 'notification.new'.
+            example:
+              event_id: evt-2024-0001
+              tenant_key: contracts-app
+              application_id: contracts-backoffice
+              topic: contracts.approved
+              title: Contratto approvato
+              body: Il contratto #A-42 è stato approvato.
+              severity: success
+              recipient_users: [user_42]
+      parameters:
+        - in: header
+          name: x-idempotency-key
+          schema: { type: string, maxLength: 255 }
+          description: Alternative way to provide event_id for idempotency.
+      responses:
+        '202':
+          description: Event accepted and persisted. Processing in background.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_id: { type: string }
+                  status: { type: string, example: accepted }
+        '200':
+          description: Event already processed (retry with same event_id).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_id: { type: string }
+                  status: { type: string }
+                  inbox_status:
+                    type: string
+                    enum: [pending, processing, processed, failed]
+        '400':
+          description: Invalid payload or missing event_id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Missing or invalid Basic credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          description: Rate limit exceeded (100 events/min per tenant).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications:
+    get:
+      summary: List notifications (paginated)
+      description: Lists personal notifications for the authenticated user with offset pagination.
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      parameters:
+        - in: query
+          name: status
+          required: true
+          schema:
+            type: string
+            enum: [unread, all]
+            default: all
+          description: Filter by read status.
+        - in: query
+          name: page
+          required: true
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: topic
+          schema: { type: string, maxLength: 255 }
+          description: Optional exact match filter on topic.
+        - in: query
+          name: application_id
+          schema: { type: string, maxLength: 100 }
+          description: Optional filter by producer application.
+      responses:
+        '200':
+          description: Page of notifications.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/InboxItem' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          description: Rate limit exceeded (300/min per user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications/unread-count:
+    get:
+      summary: Get unread notification count
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      responses:
+        '200':
+          description: Unread count for the authenticated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications/sync:
+    get:
+      summary: Sync notifications (cursor-based)
+      description: |
+        Incremental cursor-based sync to align the client after reconnections.
+        Preferred over offset pagination for incremental fetches.
+        The client stores the last cursor received and passes it on the next sync call.
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      parameters:
+        - in: query
+          name: after
+          required: true
+          schema: { type: string }
+          description: Cursor in format 'notif_N'. Returns items with id > N in ascending order.
+        - in: query
+          name: limit
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Items after the cursor.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/InboxItem' }
+                  cursor:
+                    type: string
+                    nullable: true
+                    description: New cursor for next sync. null if no more records.
+        '400':
+          description: Invalid query params or cursor format.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications/{notification_uuid}/read:
+    post:
+      summary: Mark single notification as read
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      parameters:
+        - in: path
+          name: notification_uuid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204':
+          description: Notification marked as read.
+        '400':
+          description: Invalid UUID.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications/read:
+    post:
+      summary: Mark bulk notifications as read
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notification_uuids]
+              properties:
+                notification_uuids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  minItems: 1
+                  maxItems: 200
+      responses:
+        '204':
+          description: All specified notifications marked as read.
+        '400':
+          description: Invalid payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/notifications/read-all:
+    post:
+      summary: Mark all unread notifications as read
+      tags: [Inbox]
+      security:
+        - TenantJWT: []
+      responses:
+        '204':
+          description: All unread notifications marked as read.
+        '401':
+          description: JWT missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/admin/tenants:
+    post:
+      summary: Create tenant
+      description: |
+        Provisions a new tenant on the platform. Creates tenant in DB, configures
+        issuer/audience/JWKS for JWT validation, and returns api_key/api_secret for
+        producer calls. Credentials are shown only once — store them immediately.
+      tags: [Admin]
+      security:
+        - AdminSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_key, name, issuer, jwks_url, audience]
+              properties:
+                tenant_key:
+                  type: string
+                  pattern: '^[a-z0-9_-]+$'
+                  maxLength: 100
+                  description: Unique logical tenant identifier (alphanumeric + '-' + '_').
+                name:
+                  type: string
+                  maxLength: 255
+                  description: Human-readable tenant name.
+                issuer:
+                  type: string
+                  format: uri
+                  maxLength: 500
+                  description: Expected 'iss' claim in JWTs of this tenant.
+                jwks_url:
+                  type: string
+                  format: uri
+                  maxLength: 1000
+                  description: JWKS URL for JWT signature validation.
+                audience:
+                  type: string
+                  maxLength: 255
+                  description: Expected 'aud' claim in JWTs of this tenant.
+            example:
+              tenant_key: contracts-app
+              name: Contracts Backoffice
+              issuer: https://auth.contracts.example.com/
+              jwks_url: https://auth.contracts.example.com/.well-known/jwks.json
+              audience: notification-platform
+      responses:
+        '201':
+          description: Tenant created with producer credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  tenant_key: { type: string }
+                  credentials:
+                    type: object
+                    properties:
+                      api_key: { type: string }
+                      api_secret: { type: string }
+                      notice:
+                        type: string
+                        example: Store these now. They will not be shown again.
+        '400':
+          description: Invalid payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: x-admin-secret missing or incorrect.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: tenant_key already exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /health:
+    get:
+      summary: Liveness probe
+      description: Always returns 200 while the process is serving requests.
+      tags: [Probes]
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /ready:
+    get:
+      summary: Readiness probe
+      description: Checks DB and Redis connectivity. Returns 503 if any dependency fails.
+      tags: [Probes]
+      responses:
+        '200':
+          description: All dependencies ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                  checks:
+                    type: object
+                    properties:
+                      db: { type: string, enum: [ok, fail] }
+                      redis: { type: string, enum: [ok, fail] }
+        '503':
+          description: At least one dependency failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                  checks:
+                    type: object
+                    properties:
+                      db: { type: string, enum: [ok, fail] }
+                      redis: { type: string, enum: [ok, fail] }
+
+tags:
+  - name: Tenant
+    description: Endpoints implemented by the tenant backend (not the Ermes core).
+  - name: Producer
+    description: Event ingestion. Authenticated with HTTP Basic (api_key:api_secret).
+  - name: Inbox
+    description: User inbox management. Authenticated with Tenant JWT (Bearer RS256).
+  - name: Admin
+    description: Platform administration. Authenticated with x-admin-secret header.
+  - name: Probes
+    description: Health and readiness probes. No authentication required.
