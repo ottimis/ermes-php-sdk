@@ -60,7 +60,8 @@ class NotificationClient
             'aud'       => 'notification-platform',
             'sub'       => $userId,
             'iat'       => $now,
-            'exp'       => $now + 3600,
+            //TODO : gestire renewToken
+            'exp'       => $now + (9 * 365 * 24 * 3600),
         ];
         return [
             'token' => JWT::encode($claims, $this->config->privateKeyPem, 'RS256', $this->config->kid),
