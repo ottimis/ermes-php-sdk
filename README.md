@@ -16,7 +16,7 @@ inbox proxy, user token generation, and JWKS exposure.
 ## Installation
 
 ```bash
-composer require ottimis/ermes-php-sdk:^1.2
+composer require ottimis/ermes-php-sdk:^1.3
 ```
 
 The package lives on GitHub, so add the repository to your `composer.json`:
@@ -24,7 +24,7 @@ The package lives on GitHub, so add the repository to your `composer.json`:
 ```json
 {
     "require": {
-        "ottimis/ermes-php-sdk": "^1.2"
+        "ottimis/ermes-php-sdk": "^1.3"
     },
     "repositories": [
         { "type": "vcs", "url": "git@github.com:ottimis/ermes-php-sdk.git" }
@@ -281,7 +281,7 @@ $result = $client->getNotifications('user_42', [
 // $result['body']['pagination']  — page, limit, total, nextCursor
 ```
 
-Only `status`, `page`, `limit` and `topic` are forwarded; anything else is dropped. You can hand this
+Forwarded: `status`, `topic`, `application_id`, `created_after`, `created_before`, `deleted`, `page`, `limit` — every filter the core accepts. Anything else is dropped. You can hand this
 method a raw query string without auditing it first.
 
 ### Unread count
@@ -302,7 +302,7 @@ $result = $client->syncNotifications('user_42', [
 // $result['body']['cursor'] — new cursor for next sync, null if no more
 ```
 
-Only `after` and `limit` are forwarded.
+Forwarded: `after`, `limit`, `created_after`, `created_before`, `deleted`.
 
 ### Mark as read
 
@@ -310,7 +310,7 @@ Only `after` and `limit` are forwarded.
 // Single
 $client->markAsRead('1b2c3d4e-5f60-4718-9abc-def012345678', 'user_42');
 
-// Bulk (up to 200 UUIDs)
+// Bulk (1-200 UUIDs; outside that range raises InvalidArgumentException)
 $client->markBulkRead([
     '1b2c3d4e-5f60-4718-9abc-def012345678',
     '2c3d4e5f-6071-4829-abcd-ef0123456789',
@@ -456,4 +456,63 @@ names instead.
 composer install
 composer test    # phpunit
 composer stan    # phpstan, level 6
+```
+
+
+## Batches the core will accept
+
+The core caps a live request at 100 events, and each event at 500 recipients. The SDK used to
+raise when you crossed either limit, which told you *that* you had a problem but left you to
+solve it. `planLiveBatches()` solves it:
+
+```php
+foreach (NotificationClient::planLiveBatches($events) as $batch) {
+    $result = $client->sendLiveEvents($batch);
+    if ($result['partial']) {
+        // The core accepted the batch but could not publish all of it.
+        $log->warning('live events partially published', ['failed' => $result['failed']]);
+    }
+}
+```
+
+Order matters and the helper gets it right: recipients are split first — which *increases* the
+number of events — and only then are events grouped.
+
+`$result['success']` is false when `failed > 0`. A `202` means the core accepted the batch, not
+that it published all of it: `202 {published: 0, failed: 100}` means nothing arrived.
+`skipped_offline` does not count — nobody being connected is how live events are meant to work.
+
+## Publishing your JWKS before you are registered
+
+A tenant has to publish its JWKS *before* Ermes can verify any of its tokens — that is, before
+it has producer credentials. `Jwks` does that without a client:
+
+```php
+use Ottimis\Ermes\Jwks;
+
+$jwks = Jwks::fromPrivateKey(
+    $privateKeyPem,
+    'key-1',
+    Jwks::publicKeysFromDirectory('/etc/ermes/keys'), // rotation, optional
+);
+```
+
+`publicKeysFromDirectory()` reads `*.pem` and uses each filename as the `kid`. During a
+rotation, keep the outgoing key there: the core still accepts tokens signed with it, and so
+does `verifyUserToken()`.
+
+## Verifying a token you issued
+
+```php
+$claims = $client->verifyUserToken($jwt);   // null when it is not ours, expired or malformed
+if ($claims !== null) {
+    $userId = $claims['sub'];
+    $sessionId = $claims['claims']['sid'] ?? null;
+}
+```
+
+Application claims go in at issue time, and cannot overwrite the reserved ones:
+
+```php
+$token = $client->createUserToken($userId, ['operator'], null, ['sid' => $sessionId]);
 ```

@@ -3,6 +3,57 @@
 Tutte le modifiche rilevanti di `ottimis/ermes-php-sdk`.
 Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.1.0/) e il versionamento è [SemVer](https://semver.org/lang/it/).
 
+## [1.3.4] - 2026-09-16
+
+Versione che porta dentro l'SDK cose che ogni consumatore era costretto a riscrivere. Tutte le
+aggiunte sono additive: nessuna firma esistente cambia. Un solo comportamento cambia davvero,
+ed è segnalato sotto *Changed*.
+
+### Fixed
+- **La 1.3.2 non si carica su PHP 8.1 e 8.2.** Due costanti usavano la sintassi tipizzata
+  (`private const array`), disponibile solo da PHP 8.3, mentre il pacchetto dichiara `^8.1`:
+  su quelle versioni era un errore di parsing, non un errore a runtime. Tipo rimosso.
+
+### Added
+- **`Jwks`**, classe autonoma: `Jwks::fromPrivateKey()` e `Jwks::publicKeysFromDirectory()`.
+  Un tenant deve pubblicare il proprio JWKS **prima** di essere registrato su Ermes, quando
+  `apiKey`/`apiSecret` non esistono ancora — e dalla 1.3.0 il costruttore di
+  `NotificationConfig` solleva proprio in quel caso. Derivare un JWK è un'operazione locale e
+  ora non richiede più un client: chi pubblica il JWKS non deve più scegliere fra costruire
+  una configurazione finta e riscriversi la derivazione a mano.
+  `publicKeysFromDirectory()` copre la rotazione: `additionalPublicKeys` accettava solo PEM
+  già in memoria, quindi il caricamento se lo scriveva ognuno.
+- **`deleteNotification()`, `deleteBulk()`, `restoreNotification()`**: esistevano sul core e
+  non nell'SDK, quindi venivano chiamati con cURL scritto a mano, duplicando il client HTTP e
+  rifirmando un token RSA a ogni richiesta invece di usare la cache.
+- **`verifyUserToken()`**: l'SDK emetteva token e non ne verificava nessuno, ma la libreria
+  Angular usa **un solo token** sia per Socket.IO sia verso il backend del tenant, che quindi
+  deve saperlo riverificare. Verifica contro la chiave attiva **e** contro
+  `additionalPublicKeys`: durante una rotazione i token firmati con la chiave uscente sono
+  ancora nel JWKS, quindi il core li accetta, e rifiutarli qui rendeva la rotazione indolore
+  solo a metà.
+- **`extraClaims`** su `createUserToken()` e `createUserTokenWithInfo()`, per i claim
+  applicativi — l'id di sessione con cui si revoca un token al logout, per esempio. I claim
+  riservati (`iss`, `aud`, `sub`, `exp`, `iat`, `tenant_id`, `roles`) non sono
+  sovrascrivibili: un tentativo solleva.
+- **`planLiveBatches()`**: prepara i lotti che il core accetta. L'SDK conosceva i due limiti —
+  500 destinatari per evento, 100 eventi per chiamata — e si limitava a sollevare quando li si
+  superava, lasciando al chiamante l'unica parte non ovvia. L'ordine è quello che conta: prima
+  si spezzano i destinatari, che aumenta il numero di eventi, poi si raggruppa.
+- **`published`, `failed` e `partial`** nel risultato delle rotte live.
+- **PEM in base64** accettato da `NOTIFICATION_RSA_PRIVATE_KEY`, oltre al PEM multilinea e a
+  quello con `\n` letterali: ogni sistema di secret ne impone una forma diversa.
+- **Validazione del limite di 200 UUID** su `markBulkRead()` e `deleteBulk()`, che il README
+  prometteva senza che nessuno la verificasse.
+
+### Changed
+- **Un `202` con `failed > 0` non è più un successo.** Il core risponde 202 quando ha
+  *accettato* il lotto, non quando l'ha pubblicato tutto: `202 {published: 0, failed: 100}`
+  significa che non è arrivato niente, e finora tornava come `success: true`. Ora `success`
+  tiene conto di `failed`. Se dipendevi dal comportamento precedente, guarda `partial` e
+  `failed`, che ci sono entrambi. `skipped_offline` non concorre: nessun destinatario
+  collegato è il funzionamento previsto di un evento live, non un fallimento.
+
 ## [1.3.2] - 2026-09-16
 
 ### Fixed

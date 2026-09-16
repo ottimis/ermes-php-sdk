@@ -211,6 +211,34 @@ class NotificationConfig implements \JsonSerializable
         return filter_var($enabled, FILTER_VALIDATE_BOOLEAN);
     }
 
+    /**
+     * Accetta le tre forme in cui una chiave privata arriva da una variabile d'ambiente.
+     *
+     * PEM multilinea vero, PEM con `\n` letterali, oppure base64 di un PEM: ogni sistema di
+     * secret impone la sua, e chi passa da uno all'altro si ritrova con una chiave che il
+     * codice non riconosce. Accettarle tutte non cambia il significato di nessuna chiave oggi
+     * valida.
+     *
+     * Una stringa che non e' nessuna delle tre viene restituita invariata: sara' il primo uso
+     * a dire che non e' una chiave, con un messaggio che parla di chiavi e non di formati.
+     */
+    private static function normalizePem(
+        #[\SensitiveParameter]
+        string $raw,
+    ): string {
+        if (str_contains($raw, '-----BEGIN')) {
+            return str_replace('\n', "\n", $raw);
+        }
+
+        $compact = preg_replace('/\s+/', '', $raw) ?? '';
+        $decoded = $compact === '' ? false : base64_decode($compact, true);
+        if (is_string($decoded) && str_contains($decoded, '-----BEGIN')) {
+            return $decoded;
+        }
+
+        return $raw;
+    }
+
     private static function loadKeyFromEnv(bool $required): string
     {
         $path = getenv('NOTIFICATION_RSA_PRIVATE_KEY_PATH');
@@ -230,7 +258,7 @@ class NotificationConfig implements \JsonSerializable
 
         $inline = getenv('NOTIFICATION_RSA_PRIVATE_KEY');
         if (is_string($inline) && trim($inline) !== '') {
-            return str_replace('\n', "\n", $inline);
+            return self::normalizePem($inline);
         }
 
         if (!$required) {

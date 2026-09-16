@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ottimis\Ermes;
 
 use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
 use Ottimis\Ermes\Http\CurlHttpClient;
 use Ottimis\Ermes\Http\HttpClientInterface;
 use Psr\Log\LoggerInterface;
@@ -22,6 +23,7 @@ use Psr\Log\LoggerInterface;
  *
  * @phpstan-type ErmesResult array{success: bool, core_status: int, statusCode: int, body: array<string, mixed>|null, error: string|null, skipped: bool}
  * @phpstan-type ErmesSendResult array{success: bool, core_status: int, statusCode: int, body: array<string, mixed>|null, error: string|null, skipped: bool, event_id: string}
+ * @phpstan-type ErmesLiveResult array{success: bool, core_status: int, statusCode: int, body: array<string, mixed>|null, error: string|null, skipped: bool, published: int, failed: int, partial: bool}
  */
 class NotificationClient
 {
@@ -34,6 +36,9 @@ class NotificationClient
     private const MAX_RECIPIENTS = 500;
     private const MAX_LIVE_EVENTS = 100;
 
+    /** Tetto del core sulle operazioni massive di inbox (read/delete). */
+    private const MAX_UUIDS = 200;
+
     /** Margine di sicurezza sulla cache dei token: non si riusa un token che sta per scadere. */
     private const TOKEN_CACHE_SKEW_SECONDS = 60;
 
@@ -41,6 +46,9 @@ class NotificationClient
 
     /** @var array<string, array{token: string, info: array<string, mixed>}> */
     private array $tokenCache = [];
+
+    /** @var array<string, string>|null chiavi pubbliche di verifica, derivate una volta sola */
+    private ?array $verificationKeys = null;
 
     public function __construct(
         private readonly NotificationConfig $config,
@@ -62,29 +70,25 @@ class NotificationClient
      */
     public function getJwks(): array
     {
-        $keys = [];
-
-        $current = $this->jwkFromPem($this->config->privateKeyPem(), $this->config->kid, true);
-        if ($current !== null) {
-            $keys[] = $current;
-        }
-
-        foreach ($this->config->additionalPublicKeys as $kid => $pem) {
-            $extra = $this->jwkFromPem((string) $pem, (string) $kid, false);
-            if ($extra !== null) {
-                $keys[] = $extra;
-            }
-        }
-
-        return ['keys' => $keys];
+        // La derivazione vive in Jwks perche' non ha bisogno di un client: chi deve solo
+        // pubblicare il proprio JWKS — cosa che va fatta PRIMA di essere registrati su Ermes,
+        // quando le credenziali del produttore non esistono ancora — puo' chiamare
+        // Jwks::fromPrivateKey() senza costruire un NotificationConfig completo.
+        return Jwks::fromPrivateKey(
+            $this->config->privateKeyPem(),
+            $this->config->kid,
+            $this->config->additionalPublicKeys,
+            $this->logger,
+        );
     }
 
     /**
      * Emette un JWT RS256 per l'utente, da usare per l'handshake Socket.IO e per l'inbox.
      * Torna la sola stringa del token.
      *
-     * @param string[] $roles ruoli applicativi propagati nel claim `roles`
-     * @param int|null $ttl   durata in secondi; null usa `userTokenTtl` della config (default 1 ora).
+     * @param string[]             $roles       ruoli applicativi propagati nel claim `roles`
+     * @param array<string, mixed> $extraClaims claim applicativi, non possono sovrascrivere i riservati
+     * @param int|null             $ttl   durata in secondi; null usa `userTokenTtl` della config (default 1 ora).
      *                        Un token è irrevocabile fino alla scadenza: allungarlo è una scelta
      *                        da fare consapevolmente, non un default.
      */
@@ -93,16 +97,18 @@ class NotificationClient
         string $userId,
         array $roles = ['operator'],
         ?int $ttl = null,
+        array $extraClaims = [],
     ): string {
-        return $this->createUserTokenWithInfo($userId, $roles, $ttl)['token'];
+        return $this->createUserTokenWithInfo($userId, $roles, $ttl, $extraClaims)['token'];
     }
 
     /**
      * Come createUserToken(), ma torna anche i claim: `info['exp']` dice al frontend quando
      * dovrà chiedere un token nuovo.
      *
-     * @param string[] $roles
-     * @param int|null $ttl
+     * @param string[]             $roles
+     * @param array<string, mixed> $extraClaims
+     * @param int|null             $ttl
      *
      * @return array{token: string, info: array<string, mixed>}
      */
@@ -111,6 +117,7 @@ class NotificationClient
         string $userId,
         array $roles = ['operator'],
         ?int $ttl = null,
+        array $extraClaims = [],
     ): array {
         if (trim($userId) === '') {
             throw new \InvalidArgumentException('Ermes SDK: userId is required to issue a user token.');
@@ -127,7 +134,8 @@ class NotificationClient
         }
 
         $roles    = array_values($roles);
-        $cacheKey = $userId . '|' . implode(',', $roles) . '|' . $ttl;
+        $cacheKey = $userId . '|' . implode(',', $roles) . '|' . $ttl
+            . '|' . ($extraClaims === [] ? '' : md5(serialize($extraClaims)));
         $now      = time();
 
         // Le chiamate proxy dell'inbox firmano un token a ogni richiesta: senza cache si
@@ -137,7 +145,10 @@ class NotificationClient
             return $cached;
         }
 
-        $claims = [
+        // I claim riservati si scrivono DOPO quelli applicativi: nessun `extraClaims` puo'
+        // cambiare mittente, destinatario o scadenza del token. Gli extra servono per cose
+        // come l'id di sessione, con cui il backend del tenant revoca un token al logout.
+        $claims = array_merge($this->filterExtraClaims($extraClaims), [
             'tenant_id' => $this->config->tenantKey,
             'roles'     => $roles,
             'iss'       => $this->config->issuer,
@@ -145,7 +156,7 @@ class NotificationClient
             'sub'       => $userId,
             'iat'       => $now,
             'exp'       => $now + $ttl,
-        ];
+        ]);
 
         $result = [
             'token' => JWT::encode($claims, $this->config->privateKeyPem(), 'RS256', $this->config->kid),
@@ -170,6 +181,105 @@ class NotificationClient
      * @return ErmesSendResult
      *
      * @throws \InvalidArgumentException se l'evento non rispetta i vincoli del core
+     */
+    /**
+     * Verifica un token emesso da questo SDK e ne restituisce i claim.
+     *
+     * Serve a chi monta il proxy dell'inbox: `@ottimis/ermes-ng` usa UN SOLO token sia per
+     * l'handshake Socket.IO sia per l'`Authorization` verso il backend del tenant, quindi
+     * quel backend deve saper riverificare i propri token. Finora ognuno se lo riscriveva.
+     *
+     * Verifica contro la chiave attiva E contro `additionalPublicKeys`: durante una rotazione
+     * i token firmati con la chiave uscente sono ancora validi — il core li accetta, perche'
+     * sono nel JWKS — e rifiutarli qui renderebbe la rotazione indolore solo a meta'.
+     *
+     * Torna `null` e non lancia per qualunque motivo di rifiuto: su questa strada arrivano
+     * anche i JWT di sessione dell'applicazione, e riceverne uno non e' un errore.
+     *
+     * @return array{sub: string, roles: string[], exp: int|null, claims: array<string, mixed>}|null
+     */
+    public function verifyUserToken(string $jwt): ?array
+    {
+        if (trim($jwt) === '') {
+            return null;
+        }
+
+        $claims = null;
+        foreach ($this->verificationKeys() as $kid => $key) {
+            try {
+                $claims = (array) JWT::decode($jwt, new Key($key, 'RS256'));
+                break;
+            } catch (\Throwable) {
+                // Chiave sbagliata, firma non nostra, token scaduto o malformato: si prova
+                // la successiva, e se finiscono il token semplicemente non e' nostro.
+                continue;
+            }
+        }
+
+        if ($claims === null) {
+            return null;
+        }
+        if (($claims['aud'] ?? null) !== $this->config->audience
+            || ($claims['iss'] ?? null) !== $this->config->issuer
+        ) {
+            return null;
+        }
+
+        $sub = (string) ($claims['sub'] ?? '');
+        if ($sub === '') {
+            return null;
+        }
+
+        $roles = $claims['roles'] ?? [];
+
+        return [
+            'sub'    => $sub,
+            'roles'  => is_array($roles) ? array_values(array_map('strval', $roles)) : [],
+            'exp'    => isset($claims['exp']) && is_numeric($claims['exp']) ? (int) $claims['exp'] : null,
+            'claims' => $claims,
+        ];
+    }
+
+    /**
+     * Chiavi pubbliche con cui verificare, in ordine: prima l'attiva, poi quelle di rotazione.
+     *
+     * @return array<string, string> kid => PEM pubblico
+     */
+    private function verificationKeys(): array
+    {
+        if ($this->verificationKeys !== null) {
+            return $this->verificationKeys;
+        }
+
+        $keys = [];
+        $active = @openssl_pkey_get_private($this->config->privateKeyPem());
+        if ($active !== false) {
+            $details = @openssl_pkey_get_details($active);
+            if (is_array($details) && isset($details['key'])) {
+                $keys[$this->config->kid] = (string) $details['key'];
+            }
+        }
+
+        foreach ($this->config->additionalPublicKeys as $kid => $pem) {
+            $pem = (string) $pem;
+            $key = @openssl_pkey_get_public($pem) ?: @openssl_pkey_get_private($pem);
+            if ($key === false) {
+                continue;
+            }
+            $details = @openssl_pkey_get_details($key);
+            if (is_array($details) && isset($details['key'])) {
+                $keys[(string) $kid] = (string) $details['key'];
+            }
+        }
+
+        return $this->verificationKeys = $keys;
+    }
+
+    /**
+     * @param array<string, mixed>                              $event
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     *
+     * @return ErmesSendResult
      */
     public function sendEvent(array $event, array $opts = []): array
     {
@@ -222,6 +332,54 @@ class NotificationClient
      *
      * @throws \InvalidArgumentException se il batch non rispetta i vincoli del core
      */
+    /**
+     * Prepara i lotti che il core e' disposto ad accettare.
+     *
+     * L'SDK ha sempre saputo i due limiti — 500 destinatari per evento, 100 eventi per
+     * chiamata — e si e' sempre limitato a sollevare quando li si superava, lasciando al
+     * chiamante l'unica parte non ovvia: dividere. Il risultato e' che ogni consumatore ha
+     * riscritto la stessa cinquantina di righe, e chi non l'ha fatto ha scoperto il limite in
+     * produzione, quando la prima organizzazione ha superato i 500 membri e un lotto da 100
+     * eventi e' stato rifiutato INTERO.
+     *
+     * L'ordine conta: prima si spezzano i destinatari (che aumenta il numero di eventi), poi
+     * si raggruppano gli eventi. Farlo al contrario produce lotti ancora fuori limite.
+     *
+     * Duplicare un evento su piu' lotti e' sicuro perche' gli eventi live non hanno chiave di
+     * idempotenza: non c'e' niente da deduplicare lato core.
+     *
+     * @param array<int, array<string, mixed>> $events
+     *
+     * @return array<int, array<int, array<string, mixed>>> lotti pronti per sendLiveEvents()
+     */
+    public static function planLiveBatches(array $events): array
+    {
+        $split = [];
+        foreach (array_values($events) as $event) {
+            // I duplicati si tolgono SEMPRE, non solo quando si supera il limite: il conteggio
+            // che decide la divisione dev'essere lo stesso che il core vedra'.
+            $recipients = array_values(array_unique((array) ($event['recipient_users'] ?? [])));
+            if (count($recipients) <= self::MAX_RECIPIENTS) {
+                $event['recipient_users'] = $recipients;
+                $split[] = $event;
+                continue;
+            }
+            foreach (array_chunk($recipients, self::MAX_RECIPIENTS) as $chunk) {
+                $copy = $event;
+                $copy['recipient_users'] = $chunk;
+                $split[] = $copy;
+            }
+        }
+
+        return $split === [] ? [] : array_chunk($split, self::MAX_LIVE_EVENTS);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>>                  $events
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     *
+     * @return ErmesLiveResult
+     */
     public function sendLiveEvents(array $events, array $opts = []): array
     {
         $events = array_values($events);
@@ -242,7 +400,7 @@ class NotificationClient
             $opts
         );
 
-        return $this->respond($res, [200, 202]);
+        return $this->liveRespond($res);
     }
 
     /**
@@ -352,6 +510,8 @@ class NotificationClient
      */
     public function markBulkRead(array $uuids, string $userId, array $opts = []): array
     {
+        $this->assertUuidBatch($uuids, 'notification_uuids');
+
         return $this->userPost(
             '/api/v1/notifications/read',
             $userId,
@@ -368,6 +528,62 @@ class NotificationClient
     public function markAllAsRead(string $userId, array $opts = []): array
     {
         return $this->userPost('/api/v1/notifications/read-all', $userId, [], $opts);
+    }
+
+    /**
+     * Archivia una notifica per l'utente (`archived_at`). Il core risponde 204.
+     *
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     *
+     * @return ErmesResult
+     */
+    public function deleteNotification(string $uuid, string $userId, array $opts = []): array
+    {
+        return $this->userPost(
+            '/api/v1/notifications/' . rawurlencode($uuid) . '/delete',
+            $userId,
+            [],
+            $opts
+        );
+    }
+
+    /**
+     * Archivia piu' notifiche in una chiamata.
+     *
+     * @param string[]                                          $uuids 1-200 UUID
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     *
+     * @return ErmesResult
+     *
+     * @throws \InvalidArgumentException se il numero di UUID e' fuori dai limiti del core
+     */
+    public function deleteBulk(array $uuids, string $userId, array $opts = []): array
+    {
+        $this->assertUuidBatch($uuids, 'notification_uuids');
+
+        return $this->userPost(
+            '/api/v1/notifications/delete',
+            $userId,
+            ['notification_uuids' => array_values($uuids)],
+            $opts
+        );
+    }
+
+    /**
+     * Riporta in inbox una notifica archiviata (`archived_at = NULL`).
+     *
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     *
+     * @return ErmesResult
+     */
+    public function restoreNotification(string $uuid, string $userId, array $opts = []): array
+    {
+        return $this->userPost(
+            '/api/v1/notifications/' . rawurlencode($uuid) . '/restore',
+            $userId,
+            [],
+            $opts
+        );
     }
 
     /**
@@ -418,6 +634,42 @@ class NotificationClient
      *
      * @return ErmesResult
      */
+    /**
+     * Risposta delle rotte live, con i contatori che il core restituisce.
+     *
+     * Il core risponde 202 quando ha ACCETTATO il lotto, non quando l'ha pubblicato tutto:
+     * `202 {published: 0, failed: 100}` e' una risposta legittima e significa che nulla e'
+     * arrivato. Guardare il solo status faceva passare quel caso per successo pieno, ed e'
+     * un difetto che si scopre solo leggendo i contatori — cioe' quasi mai.
+     *
+     * @param array{statusCode: int, body: string, error: string|null} $res
+     *
+     * @return ErmesLiveResult
+     */
+    private function liveRespond(array $res): array
+    {
+        $result = $this->respond($res, [200, 202]);
+        $body   = $result['body'] ?? null;
+
+        $published = is_array($body) && isset($body['published']) ? (int) $body['published'] : 0;
+        $failed    = is_array($body) && isset($body['failed']) ? (int) $body['failed'] : 0;
+
+        // `skipped_offline` NON concorre: nessun destinatario collegato e' il funzionamento
+        // previsto di un evento live, non un fallimento.
+        $result['published'] = $published;
+        $result['failed']    = $failed;
+        $result['partial']   = $failed > 0;
+        $result['success']   = $result['success'] && $failed === 0;
+
+        return $result;
+    }
+
+    /**
+     * @param array{statusCode: int, body: string, error: string|null} $res
+     * @param int[]                                                    $successCodes
+     *
+     * @return ErmesResult
+     */
     private function respond(array $res, array $successCodes): array
     {
         $statusCode = $res['statusCode'];
@@ -437,7 +689,7 @@ class NotificationClient
      * Risposta per config con `enabled: false`: nessuna chiamata parte, e il chiamante non
      * vede un errore per qualcosa che ha scelto di spegnere. `skipped` distingue il caso.
      *
-     * @return ErmesResult
+     * @return ErmesLiveResult
      */
     private function skipped(): array
     {
@@ -448,6 +700,9 @@ class NotificationClient
             'body'        => null,
             'error'       => null,
             'skipped'     => true,
+            'published'   => 0,
+            'failed'      => 0,
+            'partial'     => false,
         ];
     }
 
@@ -491,7 +746,7 @@ class NotificationClient
      * chiamante ha chiesto. E' successo con `deleted`: l'archivio delle notifiche smetteva di
      * essere consultabile senza un solo errore.
      */
-    private const array LIST_PARAMS = [
+    private const LIST_PARAMS = [
         'status',
         'topic',
         'application_id',
@@ -503,7 +758,7 @@ class NotificationClient
     ];
 
     /** Parametri accettati da GET /api/v1/notifications/sync (`syncQuerySchema` del core). */
-    private const array SYNC_PARAMS = [
+    private const SYNC_PARAMS = [
         'after',
         'limit',
         'created_after',
@@ -511,6 +766,61 @@ class NotificationClient
         'deleted',
     ];
 
+    /**
+     * Il core accetta da 1 a 200 UUID per le operazioni massive: oltre, risponde
+     * `400 invalid_payload` e l'intera chiamata si perde. Il README prometteva il limite
+     * senza che nessuno lo verificasse.
+     *
+     * @param string[] $uuids
+     */
+    /**
+     * Claim che l'SDK scrive sempre di suo, e che un chiamante non deve poter toccare.
+     *
+     * Sovrascriverli significherebbe firmare un token valido per un altro tenant, un altro
+     * utente o con un'altra scadenza: proprio le cose che la firma dovrebbe garantire.
+     */
+    private const RESERVED_CLAIMS = ['tenant_id', 'roles', 'iss', 'aud', 'sub', 'iat', 'exp'];
+
+    /**
+     * @param array<string, mixed> $extraClaims
+     *
+     * @return array<string, mixed>
+     */
+    private function filterExtraClaims(array $extraClaims): array
+    {
+        if ($extraClaims === []) {
+            return [];
+        }
+
+        $rejected = array_intersect(array_keys($extraClaims), self::RESERVED_CLAIMS);
+        if ($rejected !== []) {
+            throw new \InvalidArgumentException(
+                'Ermes SDK: extraClaims cannot override reserved claims: ' . implode(', ', $rejected) . '.'
+            );
+        }
+
+        return $extraClaims;
+    }
+
+    /**
+     * @param string[] $uuids
+     */
+    private function assertUuidBatch(array $uuids, string $field): void
+    {
+        $count = count($uuids);
+        if ($count < 1 || $count > self::MAX_UUIDS) {
+            throw new \InvalidArgumentException(
+                "Ermes SDK: {$field} accepts between 1 and " . self::MAX_UUIDS . " UUIDs, got {$count}."
+            );
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @param string[]             $allowed
+     *
+     * @return array<string, mixed>
+     */
     private function filterParams(array $params, array $allowed): array
     {
         return array_intersect_key($params, array_flip($allowed));
@@ -618,51 +928,4 @@ class NotificationClient
         }
     }
 
-    /**
-     * Estrae modulo ed esponente da un PEM. Torna null, senza lanciare, se il PEM non è
-     * leggibile o non è RSA.
-     *
-     * @return array<string, string>|null
-     */
-    private function jwkFromPem(string $pem, string $kid, bool $isPrivate): ?array
-    {
-        if (trim($pem) === '') {
-            return null;
-        }
-
-        // openssl_* emette warning su PEM malformati: qui interessa solo il valore di ritorno.
-        $key = $isPrivate
-            ? @openssl_pkey_get_private($pem)
-            : (@openssl_pkey_get_public($pem) ?: @openssl_pkey_get_private($pem));
-
-        if ($key === false) {
-            $this->logger?->warning('Ermes SDK: cannot read key for JWKS', [
-                'kid'   => $kid,
-                'error' => openssl_error_string() ?: 'unreadable PEM',
-            ]);
-
-            return null;
-        }
-
-        $details = @openssl_pkey_get_details($key);
-        if (!is_array($details) || ($details['type'] ?? null) !== OPENSSL_KEYTYPE_RSA || !isset($details['rsa']['n'], $details['rsa']['e'])) {
-            $this->logger?->warning('Ermes SDK: key is not usable as an RS256 JWK', ['kid' => $kid]);
-
-            return null;
-        }
-
-        return [
-            'kty' => 'RSA',
-            'use' => 'sig',
-            'alg' => 'RS256',
-            'kid' => $kid,
-            'n'   => $this->base64Url($details['rsa']['n']),
-            'e'   => $this->base64Url($details['rsa']['e']),
-        ];
-    }
-
-    private function base64Url(string $binary): string
-    {
-        return rtrim(strtr(base64_encode($binary), '+/', '-_'), '=');
-    }
 }
