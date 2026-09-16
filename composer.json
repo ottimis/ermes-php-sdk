@@ -1,16 +1,41 @@
 {
     "version" : "1.2.0",
-    "minimum-stability":"stable",
     "name": "ottimis/ermes-php-sdk",
     "description": "PHP SDK for Ermes notification platform",
     "type": "library",
+    "license": "proprietary",
+    "minimum-stability": "stable",
     "require": {
         "php": "^8.1",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "ext-openssl": "*",
         "firebase/php-jwt": "^6.0 || ^7.0"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^10.5",
+        "psr/log": "^1.1 || ^2.0 || ^3.0"
+    },
+    "suggest": {
+        "psr/log": "Pass a PSR-3 logger to NotificationClient to surface JWKS key problems"
     },
     "autoload": {
         "psr-4": {
             "Ottimis\\Ermes\\": "src/"
         }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ottimis\\Ermes\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "stan": "phpstan analyse"
+    },
+    "config": {
+        "sort-packages": true
     }
 }

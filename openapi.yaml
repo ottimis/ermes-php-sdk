@@ -1,11 +1,16 @@
 openapi: 3.0.3
 info:
   title: Ermes Notification Platform API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Multi-tenant notification platform. Receives business events from producer backends,
     persists personal notifications in MariaDB, and delivers them in real time to the
     frontend via Socket.IO.
+
+    **Event kinds:**
+    - Persisted notifications (POST /api/v1/events): stored, delivered to the inbox, counted as unread.
+    - Live data events (POST /api/v1/events/live): never stored, delivered only to recipients that are
+      online at that moment. No inbox, no unread count, no /sync recovery, no idempotency.
 
     **Authentication:**
     - Producer endpoints (POST /api/v1/events): HTTP Basic (api_key:api_secret)
@@ -258,6 +263,153 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
         '429':
           description: Rate limit exceeded (100 events/min per tenant).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/events/live:
+    post:
+      summary: Send live data events (not persisted)
+      description: |
+        Publishes ephemeral data events over Socket.IO to the recipients that are online at that
+        moment. Nothing is stored: these events do not appear in the inbox, do not count as unread
+        and cannot be recovered through /sync. They carry no event_id because there is nothing to
+        deduplicate — a lost event is recovered by the client re-reading its own data on reconnect.
+        Requires Ermes core >= 0.2.0.
+      tags: [Producer]
+      security:
+        - ProducerBasic: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_key, application_id, events]
+              properties:
+                tenant_key:
+                  type: string
+                  maxLength: 100
+                  description: Logical tenant identifier. Must match authenticated tenant.
+                application_id:
+                  type: string
+                  maxLength: 100
+                events:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [topic, event_name, recipient_users]
+                    properties:
+                      topic:
+                        type: string
+                        maxLength: 255
+                      event_name:
+                        type: string
+                        pattern: '^[a-zA-Z0-9_\.\:\-]{1,100}$'
+                        description: |
+                          Socket.IO event name. Cannot be 'notification.new', which belongs to
+                          persisted notifications.
+                      title:
+                        type: string
+                        nullable: true
+                        maxLength: 255
+                      severity:
+                        type: string
+                        nullable: true
+                        enum: [info, warning, error, success]
+                      entity_type:
+                        type: string
+                        nullable: true
+                        maxLength: 100
+                      entity_id:
+                        type: string
+                        nullable: true
+                        maxLength: 255
+                      recipient_users:
+                        type: array
+                        items: { type: string }
+                        minItems: 1
+                        maxItems: 500
+                      payload:
+                        type: object
+                        nullable: true
+                        description: Custom JSON metadata, propagated unchanged to the Socket.IO event.
+            example:
+              tenant_key: contracts-app
+              application_id: og-monitor
+              events:
+                - topic: monitor.session
+                  event_name: session.updated
+                  recipient_users: [user_42]
+                  payload: { session_id: 'S-9', state: running }
+      responses:
+        '202':
+          description: Batch accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer, description: Events accepted for delivery. }
+                  published: { type: integer, description: Events published to at least one online socket. }
+                  skipped_offline: { type: integer, description: Events with no recipient online. }
+                  failed: { type: integer }
+        '400':
+          description: Invalid payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Missing or invalid Basic credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '502':
+          description: Redis refused every event, nothing was published.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/presence:
+    get:
+      summary: List online users and their declared focus
+      description: |
+        Returns the tenant users with an active presence and the focus their sockets declared.
+        Use it to decide whether sending live events is worth it at all. The focus payload is
+        opaque to the platform: it is whatever the tenant's own client emitted with the `focus`
+        socket event. Requires Ermes core >= 0.2.0.
+      tags: [Producer]
+      security:
+        - ProducerBasic: []
+      responses:
+        '200':
+          description: Users currently online.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  online:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_id: { type: string }
+                        focus:
+                          type: object
+                          description: Opaque, tenant-defined payload.
+                  ttl_sec:
+                    type: integer
+                    description: Seconds a presence entry survives without a refresh.
+        '401':
+          description: Missing or invalid Basic credentials.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }

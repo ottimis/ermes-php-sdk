@@ -1,0 +1,11 @@
+parameters:
+    level: 6
+    paths:
+        - src
+        - tests
+    # Il pacchetto dichiara PHP ^8.1: l'analisi copre tutto l'intervallo supportato, così
+    # una funzionalità disponibile solo dalla 8.2 in poi non passa inosservata.
+    phpVersion:
+        min: 80100
+        max: 80400
+    treatPhpDocTypesAsCertain: false

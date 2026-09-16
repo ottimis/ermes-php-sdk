@@ -1,31 +1,33 @@
 # ermes-php-sdk
 
-PHP SDK for the Ermes notification platform. Handles event ingestion, inbox proxy, user token generation, and JWKS exposure.
+PHP SDK for the Ermes notification platform. Handles event ingestion, live data events, presence,
+inbox proxy, user token generation, and JWKS exposure.
 
 ## Requirements
 
 - PHP 8.1+
-- ext-curl
-- ext-openssl
+- ext-curl, ext-openssl, ext-json, ext-mbstring
+- Ermes core 0.2.0+ for `sendLiveEvents()` and `getPresence()`
+- `firebase/php-jwt` `^6.0 || ^7.0`. Both are accepted so the SDK can live next to
+  `ottimis/phplibs:^8`, but **prefer `^7.0`**: every release below 7.0.0 is covered by
+  [CVE-2025-45769](https://github.com/advisories/GHSA-2x45-7fc3-mxwq) (low severity, weak encryption),
+  and Composer's audit blocks them by default.
 
 ## Installation
 
 ```bash
-composer require ottimis/ermes-php-sdk
+composer require ottimis/ermes-php-sdk:^1.2
 ```
 
-Via company VCS repository, add to your `composer.json`:
+The package lives on GitHub, so add the repository to your `composer.json`:
 
 ```json
 {
     "require": {
-        "ottimis/ermes-php-sdk": "^1.0"
+        "ottimis/ermes-php-sdk": "^1.2"
     },
     "repositories": [
-        {
-            "type": "vcs",
-            "url": "https://git.yourcompany.com/ottimis/ermes-php-sdk"
-        }
+        { "type": "vcs", "url": "git@github.com:ottimis/ermes-php-sdk.git" }
     ]
 }
 ```
@@ -54,11 +56,17 @@ $config = new NotificationConfig(
 $client = new NotificationClient($config);
 ```
 
+The constructor validates what it gets: an empty tenant key or a `coreUrl` that is not an absolute
+http(s) URL throws `InvalidArgumentException` at boot, instead of turning into a 401 or a silent cURL
+error in production.
+
 ### Option B — from environment variables
 
 ```php
 $client = new NotificationClient(NotificationConfig::fromEnv());
 ```
+
+`fromEnv()` throws a `RuntimeException` naming the variable that is missing.
 
 | Env var | Required | Description |
 |---|---|---|
@@ -71,14 +79,31 @@ $client = new NotificationClient(NotificationConfig::fromEnv());
 | `NOTIFICATION_RSA_PRIVATE_KEY` | yes* | RSA private key PEM (inline, `\n` escaped) |
 | `NOTIFICATION_RSA_PRIVATE_KEY_PATH` | yes* | Path to RSA private key PEM file |
 | `NOTIFICATION_KID` | no | Key ID for JWKS (default: `key-1`) |
+| `NOTIFICATION_USER_TOKEN_TTL` | no | User token lifetime in seconds (default: `3600`) |
+| `NOTIFICATION_ENABLED` | no | `false` turns every network call off (default: `true`) |
+| `ERMES_DISABLED` | no | Kill switch, equivalent to `NOTIFICATION_ENABLED=false` |
 
 *Either `NOTIFICATION_RSA_PRIVATE_KEY` or `NOTIFICATION_RSA_PRIVATE_KEY_PATH` is required.
+
+### Turning Ermes off
+
+In environments without an Ermes core, set `ERMES_DISABLED=1` (or `enabled: false`). No call leaves the
+process, nothing pays a timeout, and every method returns `['success' => true, 'skipped' => true, ...]`.
+Check `skipped` when you need to tell "nothing was sent" from "sent successfully". Token issuing and
+`getJwks()` keep working: they are local operations.
+
+### Secrets
+
+`apiSecret` and `privateKeyPem` are not object properties: they are closed over, so `var_dump`,
+`print_r`, `var_export` and `json_encode` of the config show `***redacted***` instead of the real
+values. Read them with `$config->apiSecret()` and `$config->privateKeyPem()`.
 
 ---
 
 ## Tenant registration
 
-Before using the SDK, your tenant must be registered on the Ermes core. This is a one-time operation done by the platform operator:
+Before using the SDK, your tenant must be registered on the Ermes core. This is a one-time operation done
+by the platform operator:
 
 ```bash
 curl -X POST https://ermes.yourcompany.com/api/v1/admin/tenants \
@@ -93,21 +118,32 @@ curl -X POST https://ermes.yourcompany.com/api/v1/admin/tenants \
   }'
 ```
 
-The response returns `credentials.api_key` and `credentials.api_secret`. **Store them immediately — they are shown only once.**
+The response returns `credentials.api_key` and `credentials.api_secret`. **Store them immediately — they
+are shown only once.**
 
-Your backend must expose `/.well-known/jwks.json` so the Ermes core can validate user JWTs. Use `getJwks()` for this:
+Your backend must expose `/.well-known/jwks.json` so the Ermes core can validate user JWTs. Use
+`getJwks()` for this:
 
 ```php
 // GET /.well-known/jwks.json
 $client->getJwks(); // returns the JWKS array
 ```
 
+`getJwks()` never throws. If the private key is missing or unreadable it returns `['keys' => []]` and logs
+the problem through the PSR-3 logger, if you passed one: a 500 on this endpoint would stop Ermes from
+validating any token of your tenant, which is worse than an empty key set.
+
 ---
 
 ## Sending events
 
+> **Pass a deterministic `event_id`.** It is the core's idempotency key. When you omit it the SDK
+> generates a random one, so **every application-level retry creates a duplicate notification**. Use an
+> identifier of the domain fact — `contract-1234-terminated`, not `uniqid()`.
+
 ```php
 $result = $client->sendEvent([
+    'event_id'        => 'contract-C-1234-terminated',   // idempotency key
     'topic'           => 'contract.termination.completed',
     'title'           => 'Cessazione completata',
     'body'            => "La cessazione del contratto C-1234 è stata elaborata.",
@@ -118,18 +154,63 @@ $result = $client->sendEvent([
     'payload'         => ['contract_id' => 'C-1234'],  // optional custom JSON
 ]);
 
-// $result['success']     — true if core returned 202
-// $result['core_status'] — HTTP status from core
-// $result['body']        — decoded response body
+// $result['success']  — true on 202 (accepted) and on 200 (already_processed: safe retry)
+// $result['event_id'] — the id actually used; retry with this one
 ```
 
-`tenant_key`, `application_id`, and `event_id` are injected automatically by the SDK.
+`tenant_key` and `application_id` are injected automatically by the SDK.
+
+Sending the same `event_id` twice is safe: the core answers `200 already_processed` and the SDK reports it
+as a success, so a retrying caller does not keep retrying.
+
+The payload is validated locally before the request leaves: missing `topic`/`title`, `recipient_users`
+outside 1–500, an unknown `severity` or an over-long field raise `InvalidArgumentException` naming the
+field, instead of a `400 invalid_payload` you have to decode.
+
+---
+
+## Live data events (not persisted)
+
+Requires Ermes core >= 0.2.0. Live events are delivered over Socket.IO to the recipients that are
+**online at that moment** and are never stored: they do not appear in the inbox, do not count as unread
+and cannot be recovered through `/sync`. They carry no `event_id`, because there is nothing to
+deduplicate — a lost event is recovered by the client re-reading its own data on reconnect. It is a
+doorbell, not a record.
+
+```php
+$result = $client->sendLiveEvent([
+    'topic'           => 'monitor.session',
+    'event_name'      => 'session.updated',   // anything but 'notification.new'
+    'recipient_users' => ['user_42'],
+    'payload'         => ['session_id' => 'S-9', 'state' => 'running'],
+]);
+
+// batch: 1–100 events per request
+$client->sendLiveEvents([$eventA, $eventB]);
+
+// $result['body'] — ['accepted' => 2, 'published' => 1, 'skipped_offline' => 1, 'failed' => 0]
+```
+
+`emitted_at` belongs in your `payload` if you need it: it is a fact of your domain, not of the platform.
+
+### Presence
+
+```php
+$result = $client->getPresence();
+// $result['body']['online']  — [['user_id' => 'user_42', 'focus' => [...]], ...]
+// $result['body']['ttl_sec'] — how long a presence entry survives without a refresh
+```
+
+Use it to decide whether sending live events is worth it at all: nobody connected, nothing to deliver.
+The `focus` payload is opaque to the platform — it is whatever your own client emitted with the `focus`
+socket event.
 
 ---
 
 ## User token (Socket.IO + inbox API)
 
-The frontend needs a signed JWT to connect to the Ermes WebSocket and call the inbox HTTP API directly. Issue it from your backend:
+The frontend needs a signed JWT to connect to the Ermes WebSocket and call the inbox HTTP API directly.
+Issue it from your backend:
 
 ```php
 // Short form — token string only
@@ -137,15 +218,23 @@ $token = $client->createUserToken('user_42');
 
 // Full form — token + claims (use info.exp to know expiry)
 $result = $client->createUserTokenWithInfo('user_42');
-// $result['token']      — JWT string
-// $result['info']['exp'] — Unix timestamp, token valid for 1 hour
-// $result['info']['tenant_id'], ['iss'], ['aud'], ['sub'], ['iat']
+// $result['token']       — JWT string
+// $result['info']['exp'] — Unix timestamp
+// $result['info']['tenant_id'], ['iss'], ['aud'], ['sub'], ['iat'], ['roles']
 
 // Custom roles (default: ['operator'])
 $token = $client->createUserToken('user_42', ['operator', 'admin']);
 ```
 
-The JWT claims structure is fixed by the SDK to match Ermes server expectations. The private key is encapsulated — the only way to obtain a valid signed token is through these methods.
+**Tokens last one hour by default.** An RS256 token federated through JWKS cannot be revoked, so a stolen
+token is valid until it expires — keep that window short and re-issue at every login or refresh. Change
+the default with `userTokenTtl` in the config, or ask for a longer one per call when you really need it:
+
+```php
+$token = $client->createUserToken('user_42', ['operator'], ttl: 86400);
+```
+
+The private key is encapsulated: the only way to obtain a valid signed token is through these methods.
 
 **Frontend Socket.IO connection:**
 ```js
@@ -155,11 +244,29 @@ const socket = io('wss://ermes.yourcompany.com', {
 // or via query string: ?token=<jwt>
 ```
 
+### Rotating the signing key
+
+Publish the old public key next to the new one for as long as the tokens signed with it can still be
+alive (one hour, with the default TTL). Tokens already issued keep validating while new ones are signed
+with the new key:
+
+```php
+$config = new NotificationConfig(
+    // ...
+    privateKeyPem:        file_get_contents('/path/to/new-private.pem'),
+    kid:                  'myapp-key-2',
+    additionalPublicKeys: ['myapp-key-1' => file_get_contents('/path/to/old-public.pem')],
+);
+```
+
+Once the last token signed with `myapp-key-1` has expired, drop it from `additionalPublicKeys`.
+
 ---
 
 ## Inbox proxy methods
 
-These methods act as a proxy: your backend generates a user-scoped JWT internally and forwards the request to the Ermes core. The frontend never calls the Ermes core HTTP API directly.
+These methods act as a proxy: your backend generates a user-scoped JWT internally and forwards the request
+to the Ermes core. The frontend never calls the Ermes core HTTP API directly.
 
 ### List notifications
 
@@ -173,6 +280,9 @@ $result = $client->getNotifications('user_42', [
 // $result['body']['items']       — array of InboxItem
 // $result['body']['pagination']  — page, limit, total, nextCursor
 ```
+
+Only `status`, `page`, `limit` and `topic` are forwarded; anything else is dropped. You can hand this
+method a raw query string without auditing it first.
 
 ### Unread count
 
@@ -192,6 +302,8 @@ $result = $client->syncNotifications('user_42', [
 // $result['body']['cursor'] — new cursor for next sync, null if no more
 ```
 
+Only `after` and `limit` are forwarded.
+
 ### Mark as read
 
 ```php
@@ -208,13 +320,12 @@ $client->markBulkRead([
 $client->markAllAsRead('user_42');
 ```
 
-All mark methods return `['success' => bool, 'statusCode' => int]`.
-
 ---
 
 ## InboxItem shape
 
-All notification items (from `getNotifications`, `syncNotifications`, Socket.IO event `notification.new`) share the same shape:
+All notification items (from `getNotifications`, `syncNotifications`, Socket.IO event `notification.new`)
+share the same shape:
 
 | Field | Type | Notes |
 |---|---|---|
@@ -231,16 +342,34 @@ All notification items (from `getNotifications`, `syncNotifications`, Socket.IO 
 
 ---
 
-## Error handling
+## Results and error handling
 
-All methods return an array. Check `success` before using `body`:
+Every network method returns the same shape:
+
+```php
+[
+    'success'     => bool,          // the core answered with an expected status
+    'core_status' => int,           // HTTP status, 0 when the request never got an answer
+    'statusCode'  => int,           // same value, kept for older callers
+    'body'        => array|null,    // decoded response body
+    'error'       => string|null,   // transport failure (DNS, TLS, timeout), null otherwise
+    'skipped'     => bool,          // true only when the client is disabled
+]
+```
+
+`error` and `core_status` answer two different questions. A `429` is an answer: `error` is `null` and the
+status tells you what happened. A core that is unreachable has no status at all: `core_status` is `0` and
+`error` says whether it was DNS, TLS or a timeout.
 
 ```php
 $result = $client->sendEvent([...]);
-if (!$result['success']) {
-    // $result['core_status'] — HTTP status (400, 401, 429, 500, ...)
-    // $result['body']['error'] — error code string
-    // $result['body']['details'] — validation details (on 400)
+
+if ($result['error'] !== null) {
+    // never reached the core — retry later with the same event_id
+    $logger->warning('ermes unreachable', ['error' => $result['error']]);
+} elseif (!$result['success']) {
+    // the core refused it — $result['body']['error'] says why
+    $logger->error('ermes refused the event', ['status' => $result['core_status'], 'body' => $result['body']]);
 }
 ```
 
@@ -255,3 +384,76 @@ Common error codes from the core:
 | `tenant_mismatch` | 403 | `tenant_key` in payload does not match authenticated tenant |
 | `rate_limited` | 429 | Rate limit exceeded (events: 100/min, read: 300/min per user) |
 | `unknown_tenant` | 400 | Tenant key not found or inactive |
+
+---
+
+## Timeouts
+
+Defaults are **2 s** for the response and **1 s** for the connection, because most of these calls sit on
+the path of your own HTTP response: an unreachable core must not become a page that never loads.
+
+```php
+// per call
+$client->sendEvent($event, ['timeout_ms' => 500, 'connect_timeout_ms' => 200]);
+
+// or for every call, from the config
+$config = new NotificationConfig(/* ... */, timeoutMs: 10_000, connectTimeoutMs: 2_000);
+```
+
+Raise them for batch jobs that run outside a request cycle.
+
+---
+
+## Testing against the SDK
+
+`NotificationClient` takes any `Ottimis\Ermes\Http\HttpClientInterface`, so your tests never need the
+network:
+
+```php
+use Ottimis\Ermes\Http\HttpClientInterface;
+
+$http = new class implements HttpClientInterface {
+    public array $sent = [];
+
+    public function get(string $url, array $headers = [], array $opts = []): array
+    {
+        return ['body' => '{"count":0}', 'statusCode' => 200, 'error' => null];
+    }
+
+    public function post(string $url, array $data, array $headers = [], array $opts = []): array
+    {
+        $this->sent[] = $data;
+        return ['body' => '{"status":"accepted"}', 'statusCode' => 202, 'error' => null];
+    }
+};
+
+$client = new NotificationClient($config, $http);
+```
+
+The third constructor argument is an optional PSR-3 logger.
+
+---
+
+## Upgrading from 1.1
+
+No public signature changed. Two behaviours did, and both are in
+[CHANGELOG.md](CHANGELOG.md):
+
+- **User tokens now last one hour** instead of nine years. If some flow of yours relied on a token
+  surviving for days, pass an explicit `$ttl` or set `userTokenTtl` — but prefer re-issuing the token at
+  login and refresh.
+- **Timeouts are 2 s / 1 s** instead of 10 s and no connect limit. Batch senders should raise them
+  explicitly.
+
+If you read `$config->apiSecret` or `$config->privateKeyPem` as properties, call the methods with the same
+names instead.
+
+---
+
+## Development
+
+```bash
+composer install
+composer test    # phpunit
+composer stan    # phpstan, level 6
+```
