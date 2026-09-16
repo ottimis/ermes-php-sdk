@@ -1,5 +1,5 @@
 {
-    "version" : "1.3.1",
+    "version" : "1.3.2",
     "name": "ottimis/ermes-php-sdk",
     "description": "PHP SDK for Ermes notification platform",
     "type": "library",

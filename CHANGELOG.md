@@ -3,6 +3,30 @@
 Tutte le modifiche rilevanti di `ottimis/ermes-php-sdk`.
 Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.1.0/) e il versionamento è [SemVer](https://semver.org/lang/it/).
 
+## [1.3.2] - 2026-09-16
+
+### Fixed
+- `getNotifications()` e `syncNotifications()` inoltravano al core solo una parte dei filtri:
+  la whitelist interna era più stretta del contratto del core, e i parametri fuori elenco
+  sparivano **senza alcun errore**. Il caso concreto: con `deleted` scartato, l'archivio delle
+  notifiche risultava vuoto pur essendo popolato. Ora passano tutti i filtri che il core
+  dichiara — per la lista `status`, `topic`, `application_id`, `created_after`,
+  `created_before`, `deleted`, `page`, `limit`; per il sync `after`, `limit`, `created_after`,
+  `created_before`, `deleted` — e continuano a essere scartati quelli che il core non conosce.
+
+## [1.3.1] - 2026-09-16
+
+### Added
+- `audience` configurabile: sul core l'audience è una colonna del tenant, quindi un valore
+  fisso rendeva l'SDK inutilizzabile su un tenant provisionato diversamente.
+
+### Fixed
+- `sendEvent()` costruiva il payload unendo i campi del chiamante **dopo** quelli autorevoli:
+  un evento che contenesse `tenant_key` o `application_id` li sovrascriveva e partiva
+  dichiarando un mittente diverso da quello autenticato dalle credenziali. Ora quei due campi
+  vengono sempre dalla configurazione; `event_id` resta del chiamante, perché è la chiave di
+  idempotenza e serve ai retry.
+
 ## [1.2.0] - 2026-09-16
 
 Nessuna firma pubblica esistente è cambiata: chi è su `^1.1` aggiorna senza toccare il proprio codice.

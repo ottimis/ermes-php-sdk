@@ -134,4 +134,55 @@ final class InboxTest extends ClientTestCase
         $this->assertTrue($client->markAllAsRead('user_42')['skipped']);
         $this->assertSame(0, $this->http->requestCount());
     }
+    public function testListPassesEveryFilterTheCoreAccepts(): void
+    {
+        // Una whitelist piu' stretta del contratto del core fa sparire i filtri in silenzio:
+        // con `deleted` scartato, l'archivio delle notifiche diventava inconsultabile senza
+        // un solo errore.
+        $this->http->queue(200, ['items' => [], 'pagination' => []]);
+
+        $this->client()->getNotifications('user_42', [
+            'status'         => 'unread',
+            'topic'          => 'contracts.approved',
+            'application_id' => 'backoffice',
+            'created_after'  => '2026-01-01T00:00:00Z',
+            'created_before' => '2026-12-31T23:59:59Z',
+            'deleted'        => 'only',
+            'page'           => 2,
+            'limit'          => 50,
+        ]);
+
+        $url = $this->http->lastRequest()['url'];
+        foreach (['status', 'topic', 'application_id', 'created_after', 'created_before', 'deleted', 'page', 'limit'] as $param) {
+            $this->assertStringContainsString($param . '=', $url, "il filtro $param non viene inoltrato al core");
+        }
+    }
+
+    public function testListDropsParametersTheCoreWouldReject(): void
+    {
+        $this->http->queue(200, ['items' => [], 'pagination' => []]);
+
+        $this->client()->getNotifications('user_42', ['limit' => 10, 'inventato' => 'x']);
+
+        $this->assertStringNotContainsString('inventato', $this->http->lastRequest()['url']);
+    }
+
+    public function testSyncPassesEveryFilterTheCoreAccepts(): void
+    {
+        $this->http->queue(200, ['items' => [], 'nextCursor' => null]);
+
+        $this->client()->syncNotifications('user_42', [
+            'after'          => 'notif_10',
+            'limit'          => 20,
+            'created_after'  => '2026-01-01T00:00:00Z',
+            'created_before' => '2026-12-31T23:59:59Z',
+            'deleted'        => 'include',
+        ]);
+
+        $url = $this->http->lastRequest()['url'];
+        foreach (['after', 'limit', 'created_after', 'created_before', 'deleted'] as $param) {
+            $this->assertStringContainsString($param . '=', $url, "il filtro $param non viene inoltrato al core");
+        }
+    }
+
 }

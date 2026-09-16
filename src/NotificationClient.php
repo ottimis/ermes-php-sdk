@@ -301,7 +301,7 @@ class NotificationClient
         return $this->userGet(
             '/api/v1/notifications',
             $userId,
-            $this->filterParams($params, ['status', 'page', 'limit', 'topic']),
+            $this->filterParams($params, self::LIST_PARAMS),
             $opts
         );
     }
@@ -329,7 +329,7 @@ class NotificationClient
         return $this->userGet(
             '/api/v1/notifications/sync',
             $userId,
-            $this->filterParams($params, ['after', 'limit']),
+            $this->filterParams($params, self::SYNC_PARAMS),
             $opts
         );
     }
@@ -483,6 +483,34 @@ class NotificationClient
      *
      * @return array<string, mixed>
      */
+    /**
+     * Parametri accettati da GET /api/v1/notifications.
+     *
+     * La lista rispecchia lo schema del core (`listQuerySchema`): tenerla piu' stretta non
+     * protegge da niente — il core valida comunque — e fa sparire in SILENZIO i filtri che il
+     * chiamante ha chiesto. E' successo con `deleted`: l'archivio delle notifiche smetteva di
+     * essere consultabile senza un solo errore.
+     */
+    private const array LIST_PARAMS = [
+        'status',
+        'topic',
+        'application_id',
+        'created_after',
+        'created_before',
+        'deleted',
+        'page',
+        'limit',
+    ];
+
+    /** Parametri accettati da GET /api/v1/notifications/sync (`syncQuerySchema` del core). */
+    private const array SYNC_PARAMS = [
+        'after',
+        'limit',
+        'created_after',
+        'created_before',
+        'deleted',
+    ];
+
     private function filterParams(array $params, array $allowed): array
     {
         return array_intersect_key($params, array_flip($allowed));
