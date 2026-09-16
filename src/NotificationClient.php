@@ -85,11 +85,7 @@ class NotificationClient
         $res = $this->http->post(
             $this->config->coreUrl . '/api/v1/events',
             $payload,
-            [
-                'Content-Type: application/json',
-                'Accept: application/json',
-                'Authorization: Basic ' . base64_encode("{$this->config->apiKey}:{$this->config->apiSecret}"),
-            ]
+            $this->producerHeaders()
         );
 
         $statusCode = $res['statusCode'];
@@ -97,6 +93,97 @@ class NotificationClient
             'success'     => $statusCode === 202,
             'core_status' => $statusCode,
             'body'        => json_decode($res['body'], true),
+        ];
+    }
+
+    /**
+     * Sends live data events (POST /api/v1/events/live). Requires Ermes >= 0.2.0.
+     *
+     * Live events are delivered over Socket.IO to the recipients that are ONLINE at that
+     * moment and are never persisted: they do not appear in the inbox, do not count as
+     * unread and cannot be recovered through /sync. They carry no event_id, because there
+     * is nothing stored to deduplicate; a lost event is recovered by the client re-reading
+     * its own data on reconnect.
+     *
+     * Each event requires `topic`, `event_name` (anything but 'notification.new', which
+     * belongs to persisted notifications) and a non-empty `recipient_users`.
+     *
+     * @param array<int, array<string, mixed>> $events 1-100 events
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts per-call timeouts
+     * @return array{success: bool, core_status: int, body: array|null}
+     */
+    public function sendLiveEvents(array $events, array $opts = []): array
+    {
+        $res = $this->http->post(
+            $this->config->coreUrl . '/api/v1/events/live',
+            [
+                'tenant_key'     => $this->config->tenantKey,
+                'application_id' => $this->config->applicationId,
+                'events'         => array_values($events),
+            ],
+            $this->producerHeaders(),
+            $opts
+        );
+
+        $statusCode = $res['statusCode'];
+        return [
+            'success'     => $statusCode === 202,
+            'core_status' => $statusCode,
+            'body'        => json_decode($res['body'], true),
+        ];
+    }
+
+    /**
+     * Convenience wrapper for a single live event.
+     *
+     * @param array<string, mixed> $event
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     * @return array{success: bool, core_status: int, body: array|null}
+     */
+    public function sendLiveEvent(array $event, array $opts = []): array
+    {
+        return $this->sendLiveEvents([$event], $opts);
+    }
+
+    /**
+     * Lists the tenant users with an active presence and the focus their sockets declared
+     * (GET /api/v1/presence). Requires Ermes >= 0.2.0.
+     *
+     * Use it to decide whether sending live events is worth it at all: nobody connected,
+     * nothing to deliver. The focus payload is opaque to the platform: it is whatever the
+     * tenant's own client emitted with the `focus` socket event.
+     *
+     * @param array{timeout_ms?: int, connect_timeout_ms?: int} $opts
+     * @return array{success: bool, core_status: int, body: array|null}
+     *         body: ['online' => [['user_id' => string, 'focus' => array], ...], 'ttl_sec' => int]
+     */
+    public function getPresence(array $opts = []): array
+    {
+        $res = $this->http->get(
+            $this->config->coreUrl . '/api/v1/presence',
+            $this->producerHeaders(),
+            $opts
+        );
+
+        $statusCode = $res['statusCode'];
+        return [
+            'success'     => $statusCode === 200,
+            'core_status' => $statusCode,
+            'body'        => json_decode($res['body'], true),
+        ];
+    }
+
+    /**
+     * Headers for producer (backend-to-backend) calls: HTTP Basic with the tenant API key.
+     *
+     * @return string[]
+     */
+    private function producerHeaders(): array
+    {
+        return [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Authorization: Basic ' . base64_encode("{$this->config->apiKey}:{$this->config->apiSecret}"),
         ];
     }
 
