@@ -79,6 +79,23 @@ final class SendEventTest extends ClientTestCase
         $this->assertSame($payload['event_id'], $result['event_id'], 'the caller must be able to retry with the same id');
     }
 
+    public function testTheCallerCannotImpersonateAnotherTenantOrApplication(): void
+    {
+        // Il payload del chiamante veniva unito DOPO i campi autorevoli: un evento che
+        // contenesse tenant_key o application_id li sovrascriveva, e partiva dichiarando un
+        // mittente diverso da quello autenticato dalle credenziali Basic.
+        $this->http->queue(202);
+
+        $this->client()->sendEvent($this->validEvent([
+            'tenant_key'     => 'tenant-di-qualcun-altro',
+            'application_id' => 'app-di-qualcun-altro',
+        ]));
+
+        $payload = $this->http->lastRequest()['data'];
+        $this->assertSame('myapp', $payload['tenant_key']);
+        $this->assertSame('my-backoffice', $payload['application_id']);
+    }
+
     public function testCallerSuppliedEventIdWins(): void
     {
         $this->http->queue(202);

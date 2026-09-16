@@ -141,7 +141,7 @@ class NotificationClient
             'tenant_id' => $this->config->tenantKey,
             'roles'     => $roles,
             'iss'       => $this->config->issuer,
-            'aud'       => 'notification-platform',
+            'aud'       => $this->config->audience,
             'sub'       => $userId,
             'iat'       => $now,
             'exp'       => $now + $ttl,
@@ -173,11 +173,18 @@ class NotificationClient
      */
     public function sendEvent(array $event, array $opts = []): array
     {
-        $payload = array_merge([
-            'event_id'       => 'evt-' . (int) (microtime(true) * 1000) . '-' . bin2hex(random_bytes(3)),
-            'tenant_key'     => $this->config->tenantKey,
-            'application_id' => $this->config->applicationId,
-        ], $event);
+        // I campi che dicono CHI sta scrivendo si applicano DOPO quelli del chiamante.
+        // Con `array_merge([...autorevoli], $event)` un payload che contenesse `tenant_key` o
+        // `application_id` li sovrascriveva, e l'evento partiva dichiarando un mittente
+        // diverso da quello autenticato dalle credenziali Basic. L'`event_id` invece resta
+        // del chiamante quando lo fornisce: e' la chiave di idempotenza, e serve proprio
+        // perche' un retry possa riusare la stessa.
+        $payload = $event;
+        $payload['event_id'] = isset($event['event_id']) && $event['event_id'] !== ''
+            ? (string) $event['event_id']
+            : 'evt-' . (int) (microtime(true) * 1000) . '-' . bin2hex(random_bytes(8));
+        $payload['tenant_key'] = $this->config->tenantKey;
+        $payload['application_id'] = $this->config->applicationId;
 
         $this->assertValidEvent($payload);
 

@@ -17,6 +17,9 @@ class NotificationConfig implements \JsonSerializable
     /** Durata di default del token utente, in secondi. */
     public const DEFAULT_USER_TOKEN_TTL = 3600;
 
+    /** Audience di default, uguale a quella con cui il core provisiona un tenant. */
+    public const DEFAULT_AUDIENCE = 'notification-platform';
+
     /** @var \Closure(): string */
     private readonly \Closure $readApiSecret;
 
@@ -48,6 +51,12 @@ class NotificationConfig implements \JsonSerializable
         string $privateKeyPem,
         public readonly string $kid = 'key-1',
         public readonly int $userTokenTtl = self::DEFAULT_USER_TOKEN_TTL,
+        /**
+         * Claim `aud` dei token emessi. Sul core l'audience e' una colonna del tenant:
+         * un valore fisso rende l'SDK inutilizzabile su un tenant provisionato con
+         * un'audience diversa da quella di default.
+         */
+        public readonly string $audience = self::DEFAULT_AUDIENCE,
         public readonly bool $enabled = true,
         public readonly array $additionalPublicKeys = [],
         public readonly int $timeoutMs = Http\CurlHttpClient::DEFAULT_TIMEOUT_MS,
@@ -95,6 +104,7 @@ class NotificationConfig implements \JsonSerializable
             privateKeyPem: self::loadKeyFromEnv($enabled),
             kid:           self::env('NOTIFICATION_KID', false) ?: 'key-1',
             userTokenTtl:  (int) (self::env('NOTIFICATION_USER_TOKEN_TTL', false) ?: self::DEFAULT_USER_TOKEN_TTL),
+            audience:      getenv('NOTIFICATION_AUDIENCE') ?: self::DEFAULT_AUDIENCE,
             enabled:       $enabled,
         );
     }
@@ -164,6 +174,7 @@ class NotificationConfig implements \JsonSerializable
             'privateKeyPem'        => '***redacted***',
             'kid'                  => $this->kid,
             'userTokenTtl'         => $this->userTokenTtl,
+            'audience'             => $this->audience,
             'enabled'              => $this->enabled,
             'additionalPublicKeys' => array_keys($this->additionalPublicKeys),
             'timeoutMs'            => $this->timeoutMs,

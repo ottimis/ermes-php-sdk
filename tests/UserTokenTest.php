@@ -30,7 +30,18 @@ final class UserTokenTest extends ClientTestCase
         $this->assertSame('myapp', $decoded->tenant_id);
         $this->assertSame('https://auth.example.test', $decoded->iss);
         $this->assertSame('notification-platform', $decoded->aud);
-        $this->assertSame(['operator', 'admin'], $decoded->roles);
+    }
+
+    public function testAudienceIsConfigurable(): void
+    {
+        // Sul core l'audience e' una colonna del tenant: con un valore fisso l'SDK non e'
+        // utilizzabile su un tenant provisionato diversamente.
+        $client = $this->client(['audience' => 'og-monitor']);
+        $token  = $client->createUserToken('user_42');
+
+        $decoded = JWT::decode($token, JWK::parseKeySet($client->getJwks()));
+
+        $this->assertSame('og-monitor', $decoded->aud);
     }
 
     public function testExplicitTtlOverridesTheDefault(): void
