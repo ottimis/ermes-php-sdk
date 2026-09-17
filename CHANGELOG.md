@@ -3,6 +3,26 @@
 Tutte le modifiche rilevanti di `ottimis/ermes-php-sdk`.
 Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.1.0/) e il versionamento è [SemVer](https://semver.org/lang/it/).
 
+## [1.3.5] - 2026-09-17
+
+Una sola riga di `composer.json`. Nessuna modifica al codice.
+
+### Fixed
+- **Il vincolo `php` torna a un valore corretto: `^8.2`.** La 1.3.4 dichiarava `^8.3` senza che
+  una riga di codice lo richiedesse — il pavimento era salito nello stesso commit che rimuoveva
+  le costanti tipizzate *perché* il codice potesse girare sotto 8.3, annullando quella
+  correzione. Verificato: nel sorgente non c'è sintassi sopra PHP 8.1 (nessuna costante
+  tipizzata, nessun `#[\Override]`, nessun fetch dinamico di costanti, nessun `readonly class`
+  né tipo DNF), e nessuna dipendenza di sviluppo chiede più di `>=8.1`.
+
+  L'effetto pratico era che **la 1.3.4 non si installa su PHP 8.2**, dove sta il consumatore più
+  vecchio della flotta: restava indietro di quattro release. README e CHANGELOG dicevano
+  «8.1+», la matrice CI provava `8.1`→`8.4`, e il `composer.json` accanto li smentiva entrambi.
+
+### Changed
+- **PHP 8.1 non è più supportato**, di proposito e non per un limite del codice: il pavimento è
+  8.2. Chi gira su 8.1 resta alla 1.3.2. README e matrice CI sono allineati (`8.2`, `8.3`, `8.4`).
+
 ## [1.3.4] - 2026-09-16
 
 Versione che porta dentro l'SDK cose che ogni consumatore era costretto a riscrivere. Tutte le
@@ -13,6 +33,10 @@ ed è segnalato sotto *Changed*.
 - **La 1.3.2 non si carica su PHP 8.1 e 8.2.** Due costanti usavano la sintassi tipizzata
   (`private const array`), disponibile solo da PHP 8.3, mentre il pacchetto dichiara `^8.1`:
   su quelle versioni era un errore di parsing, non un errore a runtime. Tipo rimosso.
+
+  > **Rettifica (1.3.5).** Questa voce è vera per il codice ma non per il pacchetto: lo stesso
+  > commit alzava `require.php` a `^8.3`, quindi la 1.3.4 **non è installabile su 8.1 né su
+  > 8.2** nonostante il tipo rimosso. Corretto nella 1.3.5, che porta il pavimento a `^8.2`.
 
 ### Added
 - **`Jwks`**, classe autonoma: `Jwks::fromPrivateKey()` e `Jwks::publicKeysFromDirectory()`.

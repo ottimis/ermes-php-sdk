@@ -1,12 +1,12 @@
 {
-    "version" : "1.3.4",
+    "version" : "1.3.5",
     "name": "ottimis/ermes-php-sdk",
     "description": "PHP SDK for Ermes notification platform",
     "type": "library",
     "license": "proprietary",
     "minimum-stability": "stable",
     "require": {
-        "php": "^8.3",
+        "php": "^8.2",
         "ext-curl": "*",
         "ext-json": "*",
         "ext-mbstring": "*",

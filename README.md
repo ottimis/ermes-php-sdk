@@ -5,7 +5,7 @@ inbox proxy, user token generation, and JWKS exposure.
 
 ## Requirements
 
-- PHP 8.1+
+- PHP 8.2+
 - ext-curl, ext-openssl, ext-json, ext-mbstring
 - Ermes core 0.2.0+ for `sendLiveEvents()` and `getPresence()`
 - `firebase/php-jwt` `^6.0 || ^7.0`. Both are accepted so the SDK can live next to
